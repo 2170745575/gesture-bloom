@@ -9,6 +9,13 @@ import { resolveRuntimeConfig, CONFIG } from './config.js';
 import { HandTracker, computeTension, tensionToSpread, spreadStateName } from './handTracking.js';
 import { ActionDetector } from './gestures.js';
 import { FlowerScene } from './scene.js';
+import {
+  registerServiceWorker,
+  preloadMediaPipe,
+  formatMB,
+  ASSET_TOTAL_BYTES,
+  ASSET_COUNT,
+} from './preload.js';
 
 /* ================================================================== *
  * DOM
@@ -24,6 +31,9 @@ const dom = {
   startBtn: $('start-btn'),
   skipBtn: $('skip-btn'),
   status: $('status'),
+  preload: $('preload'),
+  preloadBar: $('preload-bar'),
+  preloadText: $('preload-text'),
   tensionVal: $('tension-val'),
   meterFill: $('meter-fill'),
   stateName: $('state-name'),
@@ -364,6 +374,82 @@ function bootScene() {
   return scene;
 }
 
+/* ================================================================== *
+ * 模型预加载
+ *
+ * 页面一打开就在后台开始，不等用户点「开启摄像头」。
+ *
+ * 为什么必须这样：
+ *   原来要等用户点击后才开始下载约 16 MB 的模型，
+ *   而国内从 GitHub Pages 拉这个体积实测要 7 分钟（38 KB/s，
+ *   并行时甚至掉到 3 KB/s），90 秒就超时放弃了 —— 永远进不去。
+ *   改成后台预加载 + 实时进度后：
+ *     · 用户看说明的这段时间就在下载
+ *     · 界面上能看到"3.2 MB / 16.0 MB"，不再是死界面
+ *     · 下载完经 Service Worker 落盘缓存，第二次打开是瞬间的
+ * ================================================================== */
+
+let preloadPromise = null;
+/** 预加载结果，startGesture 会参考它来决定等待策略 */
+const preloadState = { started: false, done: false, failed: false, cached: 0, bytes: 0 };
+
+function startPreload() {
+  if (preloadState.started) return preloadPromise;
+  preloadState.started = true;
+
+  const bar = dom.preloadBar?.firstElementChild;
+  const text = dom.preloadText;
+  if (dom.preload) dom.preload.hidden = false;
+  if (bar) bar.style.width = '0%';
+  if (text) text.innerHTML = '<span class="spinner"></span>正在加载手部识别模型…';
+
+  preloadPromise = (async () => {
+    try {
+      // 先注册 Service Worker：它负责把资源缓存下来，并让下载可串行
+      const reg = await registerServiceWorker();
+      if (!reg) console.info('[main] Service Worker 不可用，改为普通预加载');
+
+      const res = await preloadMediaPipe((p) => {
+        const pct = p.totalBytes ? Math.min(100, (p.loadedBytes / p.totalBytes) * 100) : 0;
+        if (bar) bar.style.width = pct.toFixed(1) + '%';
+        if (!text) return;
+        if (p.done) return;
+        text.textContent =
+          `正在加载识别模型 ${p.index}/${p.total} · ` +
+          `${formatMB(p.loadedBytes)} / ${formatMB(p.totalBytes)}`;
+      });
+
+      preloadState.done = true;
+      preloadState.failed = !res.ok;
+      preloadState.cached = res.cachedAfter;
+      preloadState.servedFromCache = res.servedFromCache;
+      preloadState.bytes = res.bytes;
+
+      if (bar) bar.style.width = '100%';
+      if (dom.preload) dom.preload.classList.add('done');
+      if (text) {
+        if (!res.ok) {
+          text.textContent = '识别模型部分加载失败，开启摄像头时会自动重试';
+        } else if (res.servedFromCache >= ASSET_COUNT) {
+          text.textContent = `✓ 识别模型已就绪（${res.servedFromCache}/${ASSET_COUNT} 来自本地缓存，无需重新下载）`;
+        } else if (res.cachedAfter >= ASSET_COUNT) {
+          text.textContent = `✓ 识别模型已就绪（已缓存 ${res.cachedAfter}/${ASSET_COUNT}，下次打开更快）`;
+        } else {
+          text.textContent = '✓ 识别模型已就绪，可直接开启摄像头';
+        }
+      }
+    } catch (err) {
+      preloadState.done = true;
+      preloadState.failed = true;
+      console.info('[main] 预加载异常（不影响使用）：', err?.message || err);
+      if (text) text.textContent = '模型预加载未完成，开启摄像头时会自动重试';
+    }
+    return preloadState;
+  })();
+
+  return preloadPromise;
+}
+
 /** 摄像头 + MediaPipe 全链路 */
 async function startGesture() {
   dom.startBtn.disabled = true;
@@ -381,6 +467,13 @@ async function startGesture() {
 
   setStatus('<span class="spinner"></span>摄像头已就绪，正在加载手部识别模型…');
 
+  // 预加载还没跑完的话，先把剩下的等完（并显示进度），
+  // 这样 MediaPipe 自己去取文件时基本都是缓存命中，几乎瞬间完成。
+  if (preloadPromise && !preloadState.done) {
+    setStatus('<span class="spinner"></span>正在等待模型下载完成…');
+    await preloadPromise;
+  }
+
   try {
     await tracker.loadMediaPipe((msg) => setStatus(`<span class="spinner"></span>${msg}`));
   } catch (err) {
@@ -396,16 +489,19 @@ async function startGesture() {
 
   // 关键：真正跑一帧推理，确认 WASM 没有 abort。
   // 只判断「模型加载成功」是不够的—— hands.js 加载完成后，
-  // MediaPipe 还要再下载约 10MB 的 WASM 与模型数据，
-  // 慢网络下可能要好几十秒。这里必须等待并显示进度，
-  // 否则用户会看到「摄像头灯亮了但完全没反应」。
-  setStatus('<span class="spinner"></span>正在初始化识别引擎…（首次需下载约 10MB 模型）');
+  // MediaPipe 还要再下载约 16MB 的 WASM 与模型数据。
+  //
+  // 超时从 90 秒放宽到 300 秒：预加载正常情况下已经把文件都缓存好了，
+  // 这里会秒过；但如果用户在预加载完成前就点了按钮，或者缓存被清掉了，
+  // 就需要给慢网络留足时间。原来的 90 秒会在国内网速下**必然失败**，
+  // 用户看到的是"等待 90 秒后报错"，永远进不去。
+  setStatus('<span class="spinner"></span>正在初始化识别引擎…');
   try {
-    await tracker.probeOnce(90000, (waited) => {
+    await tracker.probeOnce(300000, (waited) => {
+      const secs = Math.round(waited / 1000);
       setStatus(
-        `<span class="spinner"></span>正在初始化识别引擎…已等待 ${Math.round(
-          waited / 1000
-        )} 秒（首次需下载约 10MB 模型，请保持网络畅通）`
+        `<span class="spinner"></span>正在初始化识别引擎…已等待 ${secs} 秒` +
+          `（模型约 16MB，首次加载较慢，请保持网络畅通）`
       );
     });
   } catch (err) {
@@ -667,6 +763,11 @@ function init() {
   bindUI();
   requestAnimationFrame(loop);
 
+  // 立刻在后台开始预加载模型（约 16MB）。
+  // 不等用户点「开启摄像头」——用户看说明的时间就用来下载了。
+  // 不 await：它和粒子动画并行跑，失败也不影响花朵显示。
+  startPreload();
+
   // 调试钩子：控制台或自动化测试可读取实时内部状态
   window.__bloomDebug = () => ({
     spread: Number(state.spread.toFixed(4)),
@@ -683,6 +784,18 @@ function init() {
     programs: scene?.renderer?.info?.programs?.length ?? 0,
     shaderError: scene?.shaderError || null,
     shape: scene?.currentShape ?? null,
+    // 模型预加载状态（用于自动化验证）
+    preload: {
+      started: preloadState.started,
+      done: preloadState.done,
+      failed: preloadState.failed,
+      /** 本次有几个文件由 Service Worker 直接给了缓存 */
+      servedFromCache: preloadState.servedFromCache ?? 0,
+      /** 缓存里现在有几个文件 */
+      cachedInStorage: preloadState.cached ?? 0,
+      bytes: preloadState.bytes,
+      swController: !!navigator.serviceWorker?.controller,
+    },
     morph: scene ? Number(scene._morph.toFixed(3)) : null,
   });
 

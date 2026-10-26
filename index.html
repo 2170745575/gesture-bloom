@@ -386,6 +386,35 @@
   }
   #cdn-note b { color: var(--ui-accent2); }
 
+  /* 模型预加载进度条 */
+  #preload {
+    margin: 12px 0 2px;
+  }
+  #preload-bar {
+    height: 5px;
+    border-radius: 3px;
+    background: rgba(255, 255, 255, 0.10);
+    overflow: hidden;
+  }
+  #preload-bar i {
+    display: block;
+    height: 100%;
+    width: 0%;
+    border-radius: 3px;
+    background: linear-gradient(90deg, var(--ui-accent), var(--ui-accent2));
+    box-shadow: 0 0 10px rgba(255, 214, 240, 0.5);
+    transition: width 0.28s ease;
+  }
+  #preload-text {
+    margin-top: 7px;
+    font-size: 11px;
+    color: rgba(143, 163, 196, 0.9);
+    font-variant-numeric: tabular-nums;
+  }
+  #preload-text b { color: var(--ui-accent2); }
+  #preload.done #preload-text { color: #9dffc8; }
+  #preload.done #preload-bar i { box-shadow: 0 0 10px rgba(157, 255, 200, 0.5); }
+
   .spinner {
     display: inline-block;
     width: 12px; height: 12px;
@@ -677,8 +706,20 @@
 
     <div id="status" role="status" aria-live="polite"></div>
 
+    <!--
+      模型预加载进度条
+      页面一打开就在后台开始下载模型（约 16 MB），不等用户点击。
+      没有这个条的时候，用户看到的是一个"已等待 N 秒"的死界面，
+      实测国内从 GitHub Pages 拉这 16 MB 要 7 分钟，看起来就像卡死了。
+    -->
+    <div id="preload" hidden>
+      <div id="preload-bar"><i></i></div>
+      <div id="preload-text"></div>
+    </div>
+
     <p id="cdn-note">
-      首次启动会从 CDN 下载约 <b>10MB</b> 的手部识别模型，请耐心等待。
+      首次打开会在后台加载约 <b>16MB</b> 的手部识别模型（已本地化，不走 CDN）。
+      加载完成后会缓存下来，<b>下次打开是瞬间的</b>。
     </p>
   </div>
 </div>

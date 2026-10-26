@@ -97,6 +97,63 @@ node server.js 8080     # 指定端口
 
 ---
 
+## 模型加载（这是部署后最容易踩的坑）
+
+手部识别模型约 **16 MB**，是整个项目里最脆弱的一环。记录一下实测数据和最终方案。
+
+### 实测到的三个问题
+
+| 问题 | 实测数据 |
+|---|---|
+| GitHub Pages **不压缩** `.wasm` / `.data` / `.tflite` | `Content-Encoding: 无`，6 MB 的 WASM 原样传输 |
+| `Cache-Control` **只有 10 分钟** | `max-age=600`，过期后 16 MB 要重下一遍 |
+| 并行请求**互相抢带宽** | 7 个文件同时下时，一个 276 KB 的文件用了 **86.6 秒**（≈3 KB/s）；单文件顺序下能到 38 KB/s |
+
+后果：国内从 GitHub Pages 加载要 **7 分钟以上**，
+而原来的代码 **90 秒就超时放弃** —— 所以永远进不去，
+界面上还只有一个"已等待 N 秒"的死画面。
+
+### 现在的方案
+
+1. **页面一打开就在后台预加载**，不等用户点「开启摄像头」。
+   用户看说明的那几秒就是在下载。
+2. **串行下载**，避免前面测到的抢带宽问题。
+3. **实时进度条**（`3.2 MB / 16.0 MB`），不是转圈。
+4. **Service Worker 缓存**（`sw.js`）——把资源存进 Cache Storage，
+   不受 GitHub 那 10 分钟的限制，**第二次打开是零网络流量的**。
+5. 超时从 90 秒放宽到 300 秒。
+
+### 怎么验证的
+
+判据不能用「耗时变短」——在 localhost 上一切都在 100ms 内，
+按耗时判断会把"真的下载"误判成"命中缓存"
+（实测在**全新**缓存上也报过 6/7 命中）。
+
+所以 `_test/sw-cache-check.mjs` 用 **Service Worker 主动上报的命中事件**作为直接证据：
+
+```
+第 1 次访问  servedFromCache=0   cachedInStorage=7   ← 真的下载了，并全部写入缓存
+第 2 次访问  servedFromCache=7   cachedInStorage=7   ← 全部由 SW 直接给，网络零流量
+```
+
+并按字节数逐个核对缓存内容（WASM 6,026,259 / 模型 5,478,688）。
+
+### 还能更快吗
+
+能，但没有做（会牺牲准确性或增加复杂度）：
+
+- **换 lite 模型**：`hand_landmark_lite.tflite` 只有 2.07 MB（full 是 5.48 MB），
+  省 3.4 MB。但手势阈值是按 full 模型调出来的，换了要重新标定。
+- **自己 gzip**：实测 17.38 MB → 10.81 MB（省 38%，WASM 单文件省 70%）。
+  需要额外存 `.gz` 并让 Service Worker 用 `DecompressionStream` 透明解压。
+- **换国内可访问的托管**：GitHub Pages 走 Fastly，国内被限速。
+  这是根本瓶颈，代码层面无法绕过。
+
+> 💡 如果加载特别慢，可以先用「跳过摄像头，使用自动演示」看粒子效果，
+> 模型在后台继续下载，好了再点「开启摄像头」。
+
+---
+
 ## 形态变换
 
 同一批 18000 个粒子可以在 **6 种形态**之间平滑变换，
@@ -482,6 +539,7 @@ vec3 pos = mix(aPosBud, position, localSpread);
 gesture-bloom/
 ├── 启动.cmd                ⭐ 双击这个启动（自动找 Node，找不到就用 PowerShell）
 ├── index.html              页面结构 + 全部 CSS + importmap
+├── sw.js                   Service Worker：模型资源持久缓存（10 分钟限制的解法）
 ├── server.js               零依赖 Node 静态服务器（含目录穿越防护）
 ├── _serve.ps1              备用静态服务器（无需 Node，UTF-8 带 BOM）
 ├── package.json
@@ -494,6 +552,7 @@ gesture-bloom/
 │   ├── shapes.js           形态库（蝴蝶/星系/心形/凤凰/鲸鱼）+ 居中归一化
 │   ├── shaders.js          主体花朵 + 星尘 + 星云的 GLSL
 │   ├── effects.js          特效层 GLSL（花瓣流光 / 花粉 / 冲击波光环）
+│   ├── preload.js          模型预加载（串行下载 + 进度上报）
 │   ├── scene.js            Three.js 场景、各粒子层、形态切换、泛光、镜头
 │   └── main.js             主循环、缓动、UI、权限处理、性能自适应
 ├── vendor/
@@ -598,12 +657,13 @@ node _test/base-brightness.mjs        # 分开测「粒子本体」与「泛光�
 node _test/effects-check.mjs          # 验证特效真的在动（逐帧像素差异）
 node _test/responsive-check.mjs       # 7 种视口：溢出/重叠/画布覆盖
 node _test/subpath-check.mjs          # 模拟 GitHub Pages 子目录部署（路径是否 404）
+node _test/sw-cache-check.mjs         # Service Worker 缓存（第二次打开是否零流量）
 node _test/camera-check.mjs           # 摄像头链路（用 Edge 假摄像头，无需真设备）
 node _test/cdp-check.mjs              # 控制台错误与 WebGL 状态
 ```
 
 当前状态：**logic 29/29 · gestures 24/24 · actions 6/6 · morph 26/26 ·
-effects 4/4 · 视口 7/7 · 子目录部署 9/9 · 0 错误**。
+effects 4/4 · 视口 7/7 · 子目录部署 9/9 · SW 缓存 11/11 · 0 错误**。
 
 `logic-test` 与 `gestures-test` 直接 `import` 生产代码（而非复制公式），避免测试与实现漂移。
 `brightness-check` / `actions-check` / `morph-check` 会解码 PNG 逐像素统计，

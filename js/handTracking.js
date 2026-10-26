@@ -466,7 +466,10 @@ export class HandTracker {
       s.crossOrigin = 'anonymous';
       s.async = true;
       s.dataset.handsSrc = url;
-      const timer = setTimeout(() => reject(new Error('脚本加载超时')), 25000);
+      // 超时给足：hands.js 只有 45KB，但国内访问 GitHub Pages 实测
+// 并行下载时会掉到 ~3 KB/s，25 秒是不够的。
+      // 预加载（js/preload.js）正常跑完的话这里是缓存命中，瞬间返回。
+      const timer = setTimeout(() => reject(new Error('脚本加载超时')), 90000);
       s.onload = () => {
         clearTimeout(timer);
         resolve();
