@@ -1,0 +1,13 @@
+{
+  "name": "gesture-bloom",
+  "version": "1.0.0",
+  "private": true,
+  "description": "手势控制花朵在指尖绽放 —— MediaPipe Hands + Three.js GPU 粒子",
+  "type": "module",
+  "scripts": {
+    "dev": "node server.js 5173",
+    "start": "node server.js 5173"
+  },
+  "keywords": ["three.js", "mediapipe", "hand-tracking", "particles", "glsl", "webgl"],
+  "license": "MIT"
+}
